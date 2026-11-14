@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# hc-nono: launch a coding agent inside a nono sandbox, hosted in an hc terminal.
+#
+# Usage:
+#   hc-nono [opts] [-- agent-args...]      launch (prints hc terminal JSON)
+#   hc-nono ls                             list nono-sandboxed hc terminals
+#
+# Opts:
+#   --name N        hc terminal name (default: nono-<cwd basename>)
+#   --agent A       agent preset: claude (default)
+#   --cwd DIR       project dir, granted r+w (default: $PWD)
+#   --wrap          use `nono wrap` (nono execs away: no nono ps/attach/logs/
+#                   denial review). Default is `nono run` (supervised).
+#   --allow-hc      let the sandbox reach the hc socket so the agent can
+#                   `hc send` back. WARNING: hc exec/run then runs anything
+#                   unsandboxed on the host -- this is a full sandbox escape.
+#   --fg            don't pass --bg to hc (attach-and-wait like a shell)
+#   -a/-r/-w/--allow/--read/--write/--allow-file/--read-file/--block-net/
+#   --allow-domain ...  passed to nono (flag + value)
+#
+# Sandbox uses hc-sealed.json (default + pathname AF_UNIX mediation). Without
+# it, any sandboxed process can connect to $HC_TERMINAL_SOCKET and escape via
+# `hc exec`. -p/--profile replaces it: only do that with a profile that also
+# sets linux.af_unix_mediation = "pathname".
+set -euo pipefail
+
+die() { echo "hc-nono: $*" >&2; exit 1; }
+
+if [[ "${1:-}" == ls ]]; then
+  exec hc ls --label sandbox=nono "${@:2}"
+fi
+
+here="$(dirname "$(readlink -f "$0")")"
+name="" agent=claude cwd="$PWD" mode=run bg=--bg allow_hc=0
+profile="$here/hc-sealed.json"
+nono_args=()
+while (($#)); do
+  case "$1" in
+    --name) name="$2"; shift 2 ;;
+    --agent) agent="$2"; shift 2 ;;
+    --cwd) cwd="$2"; shift 2 ;;
+    --wrap) mode=wrap; shift ;;
+    --allow-hc) allow_hc=1; shift ;;
+    -p|--profile) profile="$2"; shift 2 ;;
+    --fg) bg=""; shift ;;
+    --block-net|--allow-cwd|--capability-elevation|--rollback)
+      nono_args+=("$1"); shift ;;
+    -a|-r|-w|--allow|--read|--write|--allow-file|--read-file|--write-file|\
+    --allow-domain|--deny-domain|--network-profile|--credential|\
+    --listen-port|--allow-unix-socket|--isolate)
+      nono_args+=("$1" "$2"); shift 2 ;;
+    --) shift; break ;;
+    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $1 (agent args go after --)" ;;
+  esac
+done
+agent_args=("$@")
+
+cwd="$(cd "$cwd" && pwd)"
+name="${name:-nono-$(basename "$cwd" | tr -c 'a-z0-9_-\n' '-' | cut -c1-27)}"
+
+grant_rw=("$cwd") grant_r=() grant_rw_file=()
+
+case "$agent" in
+  claude)
+    # Resolve through mise shims/symlinks: the sandbox must see the real binary.
+    bin="$(mise which claude 2>/dev/null || command -v claude)" || die "claude not found"
+    bin="$(readlink -f "$bin")"
+    grant_r+=("$(dirname "$(dirname "$bin")")")      # install dir (versions/)
+    grant_rw+=("$HOME/.claude")
+    [[ -f "$HOME/.claude.json" ]] && grant_rw_file+=("$HOME/.claude.json")
+    # Claude refuses to start if its temp dir is unreadable.
+    tmp="/tmp/claude-$(id -u)"; mkdir -p "$tmp"; chmod 700 "$tmp"; grant_rw+=("$tmp")
+    # settings.json / CLAUDE.md etc. may be symlinks out of ~/.claude.
+    for f in "$HOME"/.claude/*; do
+      [[ -L "$f" ]] || continue
+      t="$(readlink -f "$f")"; [[ -e "$t" ]] || continue
+      [[ -d "$t" ]] && grant_r+=("$t") || grant_r+=("$(dirname "$t")")
+    done
+    cmd=("$bin")
+    ;;
+  *) die "unknown agent preset: $agent" ;;
+esac
+
+nono_cmd=(nono "$mode" --silent --profile "$profile")
+if ((allow_hc)); then
+  sock="${HC_TERMINAL_SOCKET:-/run/user/$(id -u)/herdr-core/default.sock}"
+  nono_cmd+=(--allow-unix-socket "$sock")
+fi
+[[ $mode == run ]] && nono_cmd+=(--name "$name")
+for p in "${grant_rw[@]}"; do nono_cmd+=(--allow "$p"); done
+for p in $(printf '%s\n' "${grant_r[@]}" | sort -u); do nono_cmd+=(--read "$p"); done
+for p in "${grant_rw_file[@]}"; do nono_cmd+=(--allow-file "$p"); done
+nono_cmd+=("${nono_args[@]}" -- "${cmd[@]}" "${agent_args[@]}")
+
+hc run $bg --no-notify --name "$name" --cwd "$cwd" \
+  --label sandbox=nono --label nono_mode="$mode" --label agent="$agent" --label hc_access="$allow_hc" \
+  -- "${nono_cmd[@]}"

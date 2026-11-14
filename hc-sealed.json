@@ -1,0 +1,20 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "hc-sealed",
+    "description": "default + pathname AF_UNIX mediation (blocks hc/herdr sockets)"
+  },
+  "groups": {
+    "include": []
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "allow": [],
+    "read": []
+  },
+  "linux": {
+    "af_unix_mediation": "pathname"
+  }
+}
